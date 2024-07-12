@@ -1,33 +1,42 @@
 import abc
-import random
-import os
-import pathlib
-import asyncssh
 import asyncio
 import getpass
+import logging
+import os
+import pathlib
+import random
 import stat
 import time
-import uvloop
-import logging
-from io import BytesIO
 from datetime import datetime
-from aiofile import async_open
-from queue import Queue, Empty
-from threading import Thread
 from fnmatch import fnmatchcase
-log = logging.getLogger('iris')
-uvloop.install()
+from io import BytesIO
+from queue import Empty
+from queue import Queue
+from threading import Thread
+
+import asyncssh
+from aiofile import async_open
+
+log = logging.getLogger("iris")
+
+try:
+    # noinspection PyUnresolvedReferences
+    import uvloop
+
+    uvloop.install()
+except ImportError:
+    pass
 
 
-TMP_PREFIX = '.iris-tmp.'
-IGNORED_PATTERNS = ('*.swpx', '*.md5', '.swp', '.swx', '.DS_Store', '~')
+TMP_PREFIX = ".iris-tmp."
+IGNORED_PATTERNS = ("*.swpx", "*.md5", ".swp", ".swx", ".DS_Store", "~")
 DEFAULT_MAX_SESSIONS = 10
 
 
 def enhance_pattern(pattern):
-    if pattern.endswith('/'):  # Automatically append an * if a directory is specified
-        pattern = pattern + '*'
-    pattern = pattern.replace('./', '', 1)  # if ./ at start remove it # TODO
+    if pattern.endswith("/"):  # Automatically append an * if a directory is specified
+        pattern = pattern + "*"
+    pattern = pattern.replace("./", "", 1)  # if ./ at start remove it # TODO
     return pattern
 
 
@@ -37,6 +46,7 @@ async def gather_with_concurrency(n, *coros):
     async def sem_coro(coro):
         async with semaphore:
             return await coro
+
     return await asyncio.gather(*(sem_coro(c) for c in coros))
 
 
@@ -48,25 +58,28 @@ def run(tasks):
         tasks = [tasks]
 
     loop = asyncio.get_event_loop()
-    res = loop.run_until_complete(gather_with_concurrency(64, *tasks))[0]  # TODO: Gather concurrency?
+    res = loop.run_until_complete(gather_with_concurrency(64, *tasks))[
+        0
+    ]  # TODO: Gather concurrency?
     return res
 
 
 class File:
-    def __init__(self, path, time, path_holder, change_type=None):
+    def __init__(self, path, ftime, path_holder, change_type=None):
         self.path = path
         self.holder = path_holder
-        self.time = self.set_time(time) if time is not None else None
+        self.time = self.set_time(ftime) if ftime is not None else None
         self.change_type = change_type
 
-    def set_time(self, time):
-        if isinstance(time, datetime):
-            return time
+    @staticmethod
+    def set_time(ftime):
+        if isinstance(ftime, datetime):
+            return ftime
         else:
-            if isinstance(time, str):
-                return datetime.fromtimestamp(int(float(time)))
+            if isinstance(ftime, str):
+                return datetime.fromtimestamp(int(float(ftime)))
             else:
-                return datetime.fromtimestamp(int(time))
+                return datetime.fromtimestamp(int(ftime))
 
     def fetch_time(self):
         return self.holder.get_time(self.path)
@@ -80,32 +93,42 @@ class File:
 
     def __repr__(self):
         try:
-            return f'Path: {self.path} - {self.time.ctime()} - {self.time.timestamp()}'
+            return f"Path: {self.path} - {self.time.ctime()} - {self.time.timestamp()}"
         except AttributeError:
-            return f'Path: {self.path}'
+            return f"Path: {self.path}"
 
 
 class Path:
-    def __init__(self, path, dry=False, pattern='*', ignore_pattern='//', *args, **kwargs):
-        self.path = path + ('/' if not path.endswith('/') else '')
+    def __init__(
+        self, path, dry=False, pattern="*", ignore_pattern="//", *args, **kwargs
+    ):
+        self.path = path + ("/" if not path.endswith("/") else "")  # NOSONAR
         self.host = None
         self.dry = dry
         self.pattern = pattern
         self.ignore_pattern = ignore_pattern
         self.wd = None
         self.tasks = None
-        self.CHUNK_SIZE = int(1e+7)  # Default 10 megabytes for each write/read progress
+        self.CHUNK_SIZE = int(1e7)  # Default 10 megabytes for each write/read progress
 
     def has_pattern(self, p, path):
-        return any([fnmatchcase(p.split(path)[1], enhance_pattern(pat))
-                    for pat in self.pattern.split()])
+        return any(
+            [
+                fnmatchcase(p.split(path)[1], enhance_pattern(pat))
+                for pat in self.pattern.split()
+            ]
+        )
 
     def has_ignore(self, p, path):
-        return any([fnmatchcase(p.split(path)[1], enhance_pattern(pat))
-                    for pat in self.ignore_pattern.split()])
+        return any(
+            [
+                fnmatchcase(p.split(path)[1], enhance_pattern(pat))
+                for pat in self.ignore_pattern.split()
+            ]
+        )
 
     def __repr__(self):
-        return f'Host {self.host}:{self.path}'
+        return f"Host {self.host}:{self.path}"
 
     def relative_path(self, path):
         path = os.path.abspath(path)
@@ -115,13 +138,15 @@ class Path:
     def check_connection(self):
         return True
 
-    async def _empty(self):
+    @staticmethod
+    async def _empty():
         return None
 
     def write(self, origin, target_holder, write_cb=None, write_p_cb=None):
         # Find correct path for target file
-        target_path = os.path.join(target_holder.path,
-                                   origin.holder.relative_path(origin.path))
+        target_path = os.path.join(
+            target_holder.path, origin.holder.relative_path(origin.path)
+        )
 
         # If tried to write a tmp file just delete original and return
         # This does not seem the best place but it works fine
@@ -129,26 +154,27 @@ class Path:
             return self._delete(origin, origin.holder)
 
         # Ignore some files (this is a good place as is implementation independent)
-        if (target_path.endswith(IGNORED_PATTERNS)
-                or self.has_ignore(target_path, target_holder.path)):
-            log.debug(f'Ignored file {origin}')
+        if target_path.endswith(IGNORED_PATTERNS) or self.has_ignore(
+            target_path, target_holder.path
+        ):
+            log.debug(f"Ignored file {origin}")
             return self._empty()
 
         if not self.has_pattern(target_path, target_holder.path):
             return self._empty()
 
-        if origin.change_type in [None, 'C', 'M']:
+        if origin.change_type in [None, "C", "M"]:
             return self._write(origin, target_holder, write_cb, write_p_cb)
         else:
             return self._delete(origin, target_holder, write_cb)
 
     async def _delete(self, origin, target_holder, callback=None):
-        """ Delete file """
+        """Delete file"""
         # Find correct path for target file
-        target_path = os.path.join(target_holder.path,
-                                   origin.holder.relative_path(origin.path))
+        target_path = os.path.join(
+            target_holder.path, origin.holder.relative_path(origin.path)
+        )
 
-        target = None
         try:
             target = await target_holder.get_file(target_path)
         except FileNotFoundError:
@@ -156,21 +182,23 @@ class Path:
 
         merged = False
         if origin.time > target.time:
-            log.debug(f'Calling delete on {target_path}')
+            log.debug(f"Calling delete on {target_path}")
             if not self.dry:
+                # noinspection PyProtectedMember
                 await target_holder._deletefile(target_path)
             merged = True
 
         if callback is not None:
-            callback(merged=merged, change='D')
+            callback(merged=merged, change="D")
 
         return merged
 
     async def _write(self, origin, target_holder, callback=None, p_callback=None):
-        """ Overwrite target with origin if newer """
+        """Overwrite target with origin if newer"""
         # Find correct path for target file
-        target_path = os.path.join(target_holder.path,
-                                   origin.holder.relative_path(origin.path))
+        target_path = os.path.join(
+            target_holder.path, origin.holder.relative_path(origin.path)
+        )
         force = False
         target = None
         try:
@@ -178,7 +206,7 @@ class Path:
         except FileNotFoundError:
             force = True
 
-        # Watchdog return File instances with no time, we fetch it now
+        # Watchdog return File instances with no ftime, we fetch it now
         try:
             if origin.time is None:
                 origin.time = await origin.fetch_time()
@@ -191,19 +219,26 @@ class Path:
             if origin_content is None:
                 return False
 
-            log.debug(f'Calling write on {target_path}')
+            log.debug(f"Calling write on {target_path}")
             if not self.dry:
                 basename = os.path.basename(target_path)
-                tmp_target_path = target_path.replace(basename, f'{TMP_PREFIX}{basename}')
-                log.debug(f'Calling _writefile on {target_path}')
-                await target_holder._writefile(origin_content, tmp_target_path,
-                                               mtime=origin.time, cb=p_callback)
-                log.debug(f'Calling _renamefile from {tmp_target_path} to {target_path}')
+                tmp_target_path = target_path.replace(
+                    basename, f"{TMP_PREFIX}{basename}"
+                )
+                log.debug(f"Calling _writefile on {target_path}")
+                # noinspection PyProtectedMember
+                await target_holder._writefile(
+                    origin_content, tmp_target_path, mtime=origin.time, cb=p_callback
+                )
+                log.debug(
+                    f"Calling _renamefile from {tmp_target_path} to {target_path}"
+                )
+                # noinspection PyProtectedMember
                 await target_holder._renamefile(tmp_target_path, target_path)
             merged = True
 
         if callback is not None:
-            callback(merged=merged, change='M')
+            callback(merged=merged, change="M")
 
         return merged
 
@@ -213,7 +248,7 @@ class Path:
 
         res = []
         try:
-            for i in range(n):
+            for _ in range(n):
                 res.append(self.tasks.get_nowait())
         except Empty:
             pass
@@ -260,29 +295,41 @@ class Path:
 
 
 class RemotePath(Path):
-    def __init__(self, path, host, dry=False, pattern='*', ignore_pattern='//', key='~/.ssh/id_rsa', jump_host=None, *args, **kwargs):
+    def __init__(
+        self,
+        path,
+        host,
+        dry=False,
+        pattern="*",
+        ignore_pattern="//",
+        key="~/.ssh/id_rsa",
+        jump_host=None,
+        *args,
+        **kwargs,
+    ):
         super().__init__(path, dry, pattern, ignore_pattern, *args, **kwargs)
         # Setup configs for connection
         user = os.getlogin()
         self.port = 22  # Default port
-        if '@' in host:
-            user, _, host = host.partition('@')
-        if ':' in host:
-            host, _, port = host.partition(':')
+        if "@" in host:
+            user, _, host = host.partition("@")
+        if ":" in host:
+            host, _, port = host.partition(":")
             self.port = int(port)
         self.host = host
         self.user = user
+        self._tunnel = None
 
         # Jumping connection
         self.jump = jump_host is not None
         jump_user = os.getlogin()
         self.jump_port = 22
         if jump_host is not None:
-            if '@' in jump_host:
-                jump_user, _, jump_host = jump_host.partition('@')
-            if ':' in jump_host:
-                jump_host, _, jump_port = jump_host.partition(':')
-                self.jump_port = int(port)
+            if "@" in jump_host:
+                jump_user, _, jump_host = jump_host.partition("@")
+            if ":" in jump_host:
+                jump_host, _, jump_port = jump_host.partition(":")
+                self.jump_port = int(jump_port)
         self.jump_host = jump_host
         self.jump_user = jump_user
 
@@ -298,13 +345,14 @@ class RemotePath(Path):
                 self.key = RemotePath.import_private_key(key)
             except FileNotFoundError:
                 self.key = None
-                self.password = getpass.getpass('No valid key found, '
-                                                'specify a password for auth: ')
+                self.password = getpass.getpass(
+                    "No valid key found; specify a password for auth: "
+                )
 
         self._conn = None
         self._sftp = None
         self._last_check = 0
-        self.open_sem = asyncio.Semaphore(128)  # Max open files?
+        self.open_sem = asyncio.Semaphore(128)  # TODO: Max open files?
         self.req = set()
 
         self.sessions = []
@@ -323,8 +371,13 @@ class RemotePath(Path):
 
     async def open_sftp_sessions(self):  # This is awaited on check connection
         try:
-            max_sessions = (await self.conn.run(r'sed -n "s/^MaxSessions\s*\([[:digit:]]*\)/\1/p" ' \
-                                      '/etc/ssh/sshd_config', check=True)).stdout
+            max_sessions = (
+                await self.conn.run(
+                    r'sed -n "s/^MaxSessions\s*\([[:digit:]]*\)/\1/p" '
+                    "/etc/ssh/sshd_config",
+                    check=True,
+                )
+            ).stdout
             try:
                 max_sessions = int(max_sessions) or DEFAULT_MAX_SESSIONS
             except ValueError:
@@ -332,36 +385,41 @@ class RemotePath(Path):
         except asyncssh.ProcessError:
             max_sessions = DEFAULT_MAX_SESSIONS
 
-        self.sessions = [await self.conn.start_sftp_client() for _ in range(max_sessions)]
+        self.sessions = [
+            await self.conn.start_sftp_client() for _ in range(max_sessions)
+        ]
         return self.sessions[0]  # We need to return one to be used
 
     async def ssh_connect(self):
         options = asyncssh.SSHClientConnectionOptions(
             client_keys=self.key if self.key is not None else None,
-            password=self.password if self.key is None else None)
+            password=self.password if self.key is None else None,
+        )
         if self.jump:
-            self._tunnel = await asyncssh.connect(self.jump_host,
-                                                  port=self.jump_port,
-                                                  username=self.jump_user,
-                                                  options=options)
-            self._conn = await self._tunnel.connect_ssh(self.host,
-                                                        port=self.port,
-                                                        username=self.user,
-                                                        options=options)
+            self._tunnel = await asyncssh.connect(
+                self.jump_host,
+                port=self.jump_port,
+                username=self.jump_user,
+                options=options,
+            )
+            self._conn = await self._tunnel.connect_ssh(
+                self.host, port=self.port, username=self.user, options=options
+            )
         else:
-            self._conn = await asyncssh.connect(self.host, port=self.port,
-                                                username=self.user,
-                                                options=options)
+            self._conn = await asyncssh.connect(
+                self.host, port=self.port, username=self.user, options=options
+            )
         return self._conn
 
+    @staticmethod
     def load_agent_keys(agent_path=None):
         """
         The ssh-agent is a convenience tool that aims at easying the use of
         private keys protected with a password. In a nutshell, the agent runs on
         your local computer, and you trust it enough to load one or several keys
         into the agent once and for good - and you provide the password
-        at that time.
-        Later on, each time an ssh connection needs to access a key,
+        at that ftime.
+        Later on, each ftime an ssh connection needs to access a key,
         the agent can act as a proxy for you and pass the key along
         to the ssh client without the need for you to enter the password.
         The ``load_agent_keys`` function allows your python code to access
@@ -377,26 +435,30 @@ class RemotePath(Path):
           Use the command ``ssh-add -l`` to inspect the set of keys
           currently present in your agent.
         """
+
         # pylint: disable=c0111
-        async def co_load_agent_keys(agent_path):
+        async def co_load_agent_keys(clak_agent_path):
             # make sure to return an empty list when something goes wrong
             try:
-                agent_client = asyncssh.SSHAgentClient(agent_path)
+                agent_client = asyncssh.SSHAgentClient(clak_agent_path)
                 keys = await agent_client.get_keys()
                 agent_client.close()
                 return keys
             except ValueError as exc:
                 # not quite sure which exceptions to expect here
-                log.error(f"When fetching agent keys: "
-                          f"ignored exception {type(exc)} - {exc}")
+                log.error(
+                    f"When fetching agent keys: "
+                    f"ignored exception {type(exc)} - {exc}"
+                )
                 return []
 
-        agent_path = agent_path or os.environ.get('SSH_AUTH_SOCK', None)
+        agent_path = agent_path or os.environ.get("SSH_AUTH_SOCK", None)
         if agent_path is None:
             return []
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(co_load_agent_keys(agent_path))
 
+    @staticmethod
     def import_private_key(filename):
         """
         Attempts to import a private key from file
@@ -415,7 +477,9 @@ class RemotePath(Path):
                 sshkey = asyncssh.import_private_key(data)
             except asyncssh.KeyImportError:
                 while True:
-                    passphrase = getpass.getpass(f"Enter passphrase for key {basename} : ")
+                    passphrase = getpass.getpass(
+                        f"Enter passphrase for key {basename} : "
+                    )
                     if not passphrase:
                         log.info(f"Ignoring key {filename}")
                         break
@@ -457,15 +521,16 @@ class RemotePath(Path):
 
         tasks = set()
         async for f in self.sftp.scandir(path):
-            if f.filename in ('.', '..'):  # Ignore reference to self and parent
+            if f.filename in (".", ".."):  # Ignore reference to self and parent
                 continue
 
             if stat.S_ISLNK(f.attrs.permissions):  # Ignore symbolic links
                 continue
 
             remotepath = os.path.join(path, f.filename)
-            if (not self.has_pattern(remotepath, self.path)
-                    or self.has_ignore(remotepath, self.path)):
+            if not self.has_pattern(remotepath, self.path) or self.has_ignore(
+                remotepath, self.path
+            ):
                 continue
 
             if stat.S_ISDIR(f.attrs.permissions):
@@ -480,7 +545,7 @@ class RemotePath(Path):
     async def _files_path(self, path=None):
         path = self.path if path is None else path
         files = await self._recursive_scan(path, [])
-        files = [File(path, time, self) for time, path in files]
+        files = [File(path, fptime, self) for fptime, path in files]
         return files[0] if len(files) == 1 else files
 
     async def get_content(self, path, cb):
@@ -489,7 +554,7 @@ class RemotePath(Path):
         try:
             size = (await sftp.lstat(path)).size
             async with self.open_sem:
-                async with sftp.open(path, 'rb', block_size=65536) as src:
+                async with sftp.open(path, "rb", block_size=65536) as src:
                     data = True
                     while data:
                         data = await src.read(size=self.CHUNK_SIZE)
@@ -519,14 +584,17 @@ class RemotePath(Path):
 
         await sftp.makedirs(path, exist_ok=True)
         if not await sftp.isdir(path):
-            raise asyncssh.SFTPFailure(f'{path} is not a directory') from None
+            raise asyncssh.SFTPFailure(f"{path} is not a directory") from None
 
         data = BytesIO(origin).read()
         async with self.open_sem:
-            async with sftp.open(target, 'wb', block_size=65536) as dst:
+            async with sftp.open(target, "wb", block_size=65536) as dst:
+                # noinspection DuplicatedCode
                 ith = 0
                 while ith * self.CHUNK_SIZE < len(origin):
-                    await dst.write(data[ith * self.CHUNK_SIZE: (ith + 1) * self.CHUNK_SIZE])
+                    await dst.write(
+                        data[ith * self.CHUNK_SIZE : (ith + 1) * self.CHUNK_SIZE]
+                    )
                     ith += 1
                     if cb is not None and len(origin) > self.CHUNK_SIZE:
                         cb(self.CHUNK_SIZE / len(origin))
@@ -547,16 +615,17 @@ class RemotePath(Path):
             pass
 
     def start_watchdog(self):
-        assert self.tasks is None, 'Already initialized the watchdog'
+        assert self.tasks is None, "Already initialized the watchdog"
         self.tasks = Queue(maxsize=-1)
 
         import iris.watchdog_service
+
         src_path = os.path.abspath(iris.watchdog_service.__file__)
 
         async def upload_watchdog():
-            await self.sftp.put(src_path, '/tmp/iris_wd.py')
+            await self.sftp.put(src_path, "/tmp/iris_wd.py")
 
-        log.debug('Running remote wd')
+        log.debug("Running remote wd")
         run(upload_watchdog())
         self.wd = RemoteWDThread(self)
         self.wd.start()
@@ -573,7 +642,7 @@ class RemotePath(Path):
         except AttributeError:
             pass
 
-    def next_task(self):
+    def next_task(self, n=100):
         # Be sure the connection does not drop here
         self.check_connection()
         return super().next_task()
@@ -608,48 +677,65 @@ class RemoteWDThread(Thread):
         async def async_wd():
             options = asyncssh.SSHClientConnectionOptions(
                 client_keys=self.key,
-                password=self.password if self.key is None else None)
+                password=self.password if self.key is None else None,
+            )
             provider = asyncssh.connect
             if self.jump:
-                self._tunnel = await asyncssh.connect(self.jump_host,
-                                                      port=self.jump_port,
-                                                      username=self.jump_user,
-                                                      options=options)
+                self._tunnel = await asyncssh.connect(
+                    self.jump_host,
+                    port=self.jump_port,
+                    username=self.jump_user,
+                    options=options,
+                )
                 provider = self._tunnel.connect_ssh
 
-            async with provider(self.host, port=self.port, username=self.user,
-                                keepalive_interval=60, keepalive_count_max=9,
-                                options=options) as conn:
-                async with conn.create_process('python3 -u /tmp/iris_wd.py',
-                                               input='\n'.join([self.path, self.pattern, self.ignore_pattern]),
-                                               stderr=asyncssh.STDOUT) as process:
+            async with provider(
+                self.host,
+                port=self.port,
+                username=self.user,
+                keepalive_interval=60,
+                keepalive_count_max=9,
+                options=options,
+            ) as conn:
+                async with conn.create_process(
+                    "python3 -u /tmp/iris_wd.py",
+                    input="\n".join([self.path, self.pattern, self.ignore_pattern]),
+                    stderr=asyncssh.STDOUT,
+                ) as process:
                     self.process = process
                     line = False
                     while True:
                         try:
-                            line = (await process.stdout.readline()).split('%')
+                            line = (await process.stdout.readline()).split("%")
                             path, isdir, change, mtime = line
-                            log.debug(f'Remote WD event: {path} {isdir} {change} {mtime}')
-                            if change != 'D':
+                            log.debug(
+                                f"Remote WD event: {path} {isdir} {change} {mtime}"
+                            )
+                            if change != "D":
                                 mtime = None
                             self.tasks.put(File(path, mtime, self.holder, change))
                         except Exception as e:
                             log.debug(e)
                             while line:
-                                if line != ['']:
+                                if line != [""]:
                                     log.info(line)  # Output info about exception
                                 line = await process.stdout.readline()
                             break
+
         loop.run_until_complete(async_wd())
         loop.close()
 
 
 class LocalPath(Path):
-    def __init__(self, path, dry=False, pattern='*', ignore_pattern='//', *args, **kwargs):
-        super().__init__(os.path.expanduser(path), dry, pattern, ignore_pattern, *args, **kwargs)
-        self.host = 'local'
+    def __init__(
+        self, path, dry=False, pattern="*", ignore_pattern="//", *args, **kwargs
+    ):
+        super().__init__(
+            os.path.expanduser(path), dry, pattern, ignore_pattern, *args, **kwargs
+        )
+        self.host = "local"
         self.open_sem = asyncio.Semaphore(128)  # Max open files?
-        self.CHUNK_SIZE = int(1e+8)  # 100 mb for local writing and reading
+        self.CHUNK_SIZE = int(1e8)  # 100 mb for local writing and reading
 
     def check_connection(self):
         if os.path.isdir(self.path):
@@ -665,11 +751,13 @@ class LocalPath(Path):
                 if os.path.islink(path):  # Ignore sys links
                     continue
 
-                if not self.has_pattern(path, self.path) or self.has_ignore(path, self.path):
+                if not self.has_pattern(path, self.path) or self.has_ignore(
+                    path, self.path
+                ):
                     continue
 
-                time = pathlib.Path(path).stat().st_mtime
-                files.append(File(path, time, self))
+                aftime = pathlib.Path(path).stat().st_mtime
+                files.append(File(path, aftime, self))
         return files
 
     async def get_content(self, path, cb):
@@ -678,7 +766,7 @@ class LocalPath(Path):
         fd = BytesIO()
         async with self.open_sem:
             size = os.path.getsize(path)
-            async with async_open(path, 'rb') as src:
+            async with async_open(path, "rb") as src:
                 data = True
                 while data:
                     data = await src.read(length=self.CHUNK_SIZE)
@@ -699,10 +787,14 @@ class LocalPath(Path):
     async def _writefile(self, origin, target, mtime, cb):
         os.makedirs(os.path.dirname(target), exist_ok=True)
         async with self.open_sem:
-            async with async_open(target, 'wb') as dst:
+            # noinspection DuplicatedCode
+            async with async_open(target, "wb") as dst:
+                # noinspection DuplicatedCode
                 ith = 0
                 while ith * self.CHUNK_SIZE < len(origin):
-                    await dst.write(origin[ith * self.CHUNK_SIZE: (ith + 1) * self.CHUNK_SIZE])
+                    await dst.write(
+                        origin[ith * self.CHUNK_SIZE : (ith + 1) * self.CHUNK_SIZE]
+                    )
                     ith += 1
                     if cb is not None and len(origin) > self.CHUNK_SIZE:
                         cb(self.CHUNK_SIZE / len(origin))
@@ -722,23 +814,32 @@ class LocalPath(Path):
         except FileNotFoundError:
             pass
 
-    def _wd(path, self, q):
+    def _wd(self, path, q):
         from iris.watchdog_service import run_wd
-        run_wd(path, queue=q, log=True, pattern=self.pattern,
-               ignore_pattern=self.ignore_pattern)
+
+        run_wd(
+            path,
+            queue=q,
+            log=True,
+            pattern=self.pattern,
+            ignore_pattern=self.ignore_pattern,
+        )
         while True:
-            path, isdir, change, mtime = q.get().split('%')
-            log.debug(f'Local WD event: {path} {isdir} {change} {mtime}')
-            if change != 'D':
+            npath, isdir, change, mtime = q.get().split("%")
+            log.debug(f"Local WD event: {npath} {isdir} {change} {mtime}")
+            if change != "D":
                 mtime = None
-            self.tasks.put(File(os.path.relpath(path), mtime, self, change))  # TODO: This works but is not abs, why?
+            self.tasks.put(
+                File(os.path.relpath(npath), mtime, self, change)
+            )  # TODO: This works but is not abs, why?
 
     def start_watchdog(self):
-        assert self.tasks is None, 'Already initialized the watchdog'
+        assert self.tasks is None, "Already initialized the watchdog"
         self.tasks = Queue(maxsize=-1)
 
-        self.wd = Thread(target=LocalPath._wd,
-                         args=(os.path.abspath(self.path), self,
-                               Queue(maxsize=-1)))
+        self.wd = Thread(
+            target=LocalPath._wd,
+            args=(os.path.abspath(self.path), self, Queue(maxsize=-1)),
+        )
         self.wd.daemon = True
         self.wd.start()
