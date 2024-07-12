@@ -22,12 +22,12 @@ setuptools.setup(
     zip_safe=True,
     python_requires='>=3',
     install_requires=[
-        "aiofile>=3.8.1"
-        "asyncssh>=2.14.2"
-        "PyYAML>=6.0"
-        "rich>=13.1.0"
-        "watchdog>=2.2.1"
-        "uvloop>=0.17.0"
+        "aiofile>=3.8.1",
+        "asyncssh>=2.14.2",
+        "PyYAML>=6.0",
+        "rich>=13.1.0",
+        "watchdog>=2.2.1",
+        "uvloop>=0.17.0",
     ],
     entry_points={
         'console_scripts': ['iris = iris.iris:main', 'iris-init = iris.iris:init_config']
