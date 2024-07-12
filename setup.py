@@ -18,6 +18,8 @@ setuptools.setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
+    include_package_data=False,
+    zip_safe=True,
     python_requires='>=3',
     entry_points={
         'console_scripts': ['iris = iris.iris:main', 'iris-init = iris.iris:init_config']
